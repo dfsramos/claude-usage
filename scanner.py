@@ -51,6 +51,16 @@ def init_db(conn):
             message_id              TEXT
         );
 
+        CREATE TABLE IF NOT EXISTS messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            turn_id INTEGER,
+            role TEXT,
+            content TEXT,
+            FOREIGN KEY (turn_id) REFERENCES turns(id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_messages_turn ON messages(turn_id);
+
         CREATE TABLE IF NOT EXISTS processed_files (
             path    TEXT PRIMARY KEY,
             mtime   REAL,
@@ -175,6 +185,33 @@ def parse_jsonl_file(filepath):
                         "tool_name": tool_name,
                         "cwd": cwd,
                         "message_id": message_id,
+                        "role": "assistant",
+                        "content": json.dumps(msg.get("content", [])),
+                    }
+
+                    # Dedup: last record per message_id wins (final usage tallies)
+                    if message_id:
+                        seen_messages[message_id] = turn
+                    else:
+                        turns_no_id.append(turn)
+                        
+                if rtype == "user":
+                    msg = record.get("message", {})
+                    message_id = msg.get("id", "")
+                    # User turns have no token usage, store content only
+                    turn = {
+                        "session_id": session_id,
+                        "timestamp": timestamp,
+                        "model": None,
+                        "input_tokens": 0,
+                        "output_tokens": 0,
+                        "cache_read_tokens": 0,
+                        "cache_creation_tokens": 0,
+                        "tool_name": None,
+                        "cwd": cwd,
+                        "message_id": message_id,
+                        "role": "user",
+                        "content": json.dumps(msg.get("content", [])),
                     }
 
                     # Dedup: last record per message_id wins (final usage tallies)
@@ -267,18 +304,23 @@ def upsert_sessions(conn, sessions):
 
 
 def insert_turns(conn, turns):
-    conn.executemany("""
-        INSERT OR IGNORE INTO turns
+    for t in turns:
+        cursor = conn.execute("""
+            INSERT INTO turns
             (session_id, timestamp, model, input_tokens, output_tokens,
-             cache_read_tokens, cache_creation_tokens, tool_name, cwd, message_id)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, [
-        (t["session_id"], t["timestamp"], t["model"],
-         t["input_tokens"], t["output_tokens"],
-         t["cache_read_tokens"], t["cache_creation_tokens"],
-         t["tool_name"], t["cwd"], t.get("message_id", ""))
-        for t in turns
-    ])
+             cache_read_tokens, cache_creation_tokens, tool_name, cwd)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            t["session_id"], t["timestamp"], t["model"],
+            t["input_tokens"], t["output_tokens"],
+            t["cache_read_tokens"], t["cache_creation_tokens"],
+            t["tool_name"], t["cwd"]
+        ))
+        turn_id = cursor.lastrowid
+        conn.execute("""
+            INSERT INTO messages (turn_id, role, content)
+            VALUES (?, ?, ?)
+        """, (turn_id, t.get("role"), t.get("content")))
 
 
 def scan(projects_dir=None, projects_dirs=None, db_path=DB_PATH, verbose=True):
@@ -423,6 +465,31 @@ def scan(projects_dir=None, projects_dirs=None, db_path=DB_PATH, verbose=True):
                                 "message_id": message_id,
                             }
 
+                            if message_id:
+                                seen_messages[message_id] = turn
+                            else:
+                                turns_no_id.append(turn)                                
+                        
+                        if rtype == "user":
+                            msg = record.get("message", {})
+                            message_id = msg.get("id", "")
+                            # User turns have no token usage, store content only
+                            turn = {
+                                "session_id": session_id,
+                                "timestamp": timestamp,
+                                "model": None,
+                                "input_tokens": 0,
+                                "output_tokens": 0,
+                                "cache_read_tokens": 0,
+                                "cache_creation_tokens": 0,
+                                "tool_name": None,
+                                "cwd": cwd,
+                                "message_id": message_id,
+                                "role": "user",
+                                "content": json.dumps(msg.get("content", [])),
+                            }
+
+                            # Dedup: last record per message_id wins (final usage tallies)
                             if message_id:
                                 seen_messages[message_id] = turn
                             else:
